@@ -16,7 +16,15 @@
  * free tier is the usual choice) and keep this interface.
  */
 
-export const PER_IP_LIMIT = 10;
+/**
+ * Tuned for a real visitor, not for the author testing. An engaged recruiter
+ * can easily ask eight or ten questions in a sitting, and hitting a wall
+ * mid-conversation is the worst possible experience for exactly the person
+ * this page exists for. A script abusing the endpoint does hundreds, so the
+ * gap between a curious human and a bot is wide enough that this can be
+ * generous and still do its job.
+ */
+export const PER_IP_LIMIT = 30;
 export const PER_IP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 export const GLOBAL_DAILY_LIMIT = 300;
 

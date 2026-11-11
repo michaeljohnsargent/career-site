@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { resetRateLimit } from "./rate-limit";
+import { PER_IP_LIMIT, resetRateLimit } from "./rate-limit";
 import { POST } from "./route";
 
 function postRequest(body: unknown, headers: Record<string, string> = {}) {
@@ -117,8 +117,8 @@ describe("POST /api/chat rate limiting", () => {
       vi.fn(async () => sseResponse(['data: {"choices":[{"delta":{"content":"hi"}}]}\n'])),
     );
 
-    // The limit is 10 per IP; the eleventh should be refused.
-    for (let i = 0; i < 10; i += 1) {
+    // One past the per-IP allowance should be refused.
+    for (let i = 0; i < PER_IP_LIMIT; i += 1) {
       const allowed = await POST(postRequest(askHello));
       expect(allowed.status).toBe(200);
     }
@@ -135,7 +135,7 @@ describe("POST /api/chat rate limiting", () => {
       vi.fn(async () => sseResponse(['data: {"choices":[{"delta":{"content":"hi"}}]}\n'])),
     );
 
-    for (let i = 0; i < 10; i += 1) await POST(postRequest(askHello));
+    for (let i = 0; i < PER_IP_LIMIT; i += 1) await POST(postRequest(askHello));
 
     const other = await POST(postRequest(askHello, { "x-forwarded-for": "198.51.100.2" }));
 

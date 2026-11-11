@@ -170,10 +170,15 @@ function requestCompletion(
 export async function POST(request: Request) {
   const limit = checkRateLimit(clientKeyFrom(request.headers));
   if (!limit.allowed) {
+    // Say how long, rather than leaving someone clicking retry into a wall.
+    const wait =
+      limit.retryAfterSeconds > 60
+        ? `${Math.ceil(limit.retryAfterSeconds / 60)} minutes`
+        : `${limit.retryAfterSeconds} seconds`;
     const message =
       limit.reason === "global"
         ? "The chat has hit its limit for today. Please email me instead."
-        : "That is a lot of questions at once. Please wait a moment and try again.";
+        : `Give me about ${wait} to catch up, then ask away.`;
     return errorResponse(429, message, { "Retry-After": String(limit.retryAfterSeconds) });
   }
 
