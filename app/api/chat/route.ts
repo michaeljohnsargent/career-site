@@ -112,7 +112,6 @@ function requestCompletion(
   messages: ChatMessage[],
   apiKey: string,
   signal: AbortSignal,
-  includeReasoning: boolean,
 ): Promise<Response> {
   return fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -126,15 +125,16 @@ function requestCompletion(
       model,
       messages: [{ role: "system", content: systemPrompt }, ...messages],
       max_tokens: 1024,
-      // Reasoning tokens are billed against max_tokens, and this task needs
-      // recall rather than deliberation, so they are turned off where the
-      // serving model supports saying so. The nested object is the shape
-      // OpenRouter documents; a flat `reasoning_effort` field is ignored.
+      // No `reasoning` field. OpenRouter's free router rejected it outright
+      // with a 400 in production ("Reasoning is..."), captured in the logs on
+      // 2026-11-11. Documented or not, the models this router actually serves
+      // will not take it, so it is not sent.
       //
-      // Omitted on a retry: the free router picks a different model per
-      // request and not all of them accept this parameter, which is one of
-      // the things that can turn an otherwise valid request into a 400.
-      ...(includeReasoning ? { reasoning: { effort: "none" } } : {}),
+      // The cost of omitting it: a reasoning-capable model may spend part of
+      // max_tokens thinking before it answers, which can truncate a reply.
+      // That is what finish_reason handling and the truncation notice in the
+      // chat are for, and pinning a non-reasoning model via OPENROUTER_MODEL
+      // avoids it entirely.
       // Low, because the job is factual recall from a fixed profile. Variety
       // between answers is a cost here, not a feature.
       temperature: 0.2,
@@ -194,31 +194,13 @@ export async function POST(request: Request) {
   const models =
     PRIMARY_MODEL === FALLBACK_MODEL ? [PRIMARY_MODEL] : [PRIMARY_MODEL, FALLBACK_MODEL];
 
-  const plan: { model: string; reasoning: boolean }[] = [];
-  for (const model of models) {
-    plan.push({ model, reasoning: true });
-    plan.push({ model, reasoning: false });
-  }
-
   let upstream: Response | undefined;
   let servedBy = PRIMARY_MODEL;
   let lastStatus = 0;
-  let skipNoReasoningFor = "";
 
-  for (const { model, reasoning } of plan) {
-    // Only drop the reasoning parameter if the full request was rejected as
-    // malformed. Re-sending an identical-minus-one-field request after a 500
-    // or a network error just doubles the wait for no reason.
-    if (!reasoning && skipNoReasoningFor === model) continue;
-
+  for (const model of models) {
     try {
-      const attempt = await requestCompletion(
-        model,
-        validated,
-        apiKey,
-        controller.signal,
-        reasoning,
-      );
+      const attempt = await requestCompletion(model, validated, apiKey, controller.signal);
 
       if (attempt.ok) {
         upstream = attempt;
@@ -234,24 +216,20 @@ export async function POST(request: Request) {
       }
 
       // Read the body rather than discarding it. Without this the logs say a
-      // request was rejected but never why, which is useless at 2am, and the
-      // unread body also leaves a socket dangling.
+      // request was rejected but never why, which is how the reasoning
+      // parameter stayed invisible for an afternoon. Reading it also stops an
+      // unread body leaving a socket dangling.
       const detail = await attempt.text().catch(() => "");
       console.error(
-        `OpenRouter rejected ${model} (reasoning=${reasoning}) with status ${attempt.status}: ${
+        `OpenRouter rejected ${model} with status ${attempt.status}: ${
           detail.slice(0, 600) || "<empty body>"
         }`,
       );
-
-      // Anything other than a malformed-request complaint will not be fixed by
-      // sending the same thing with one field removed.
-      if (attempt.status !== 400) skipNoReasoningFor = model;
     } catch (error) {
       if (controller.signal.aborted) {
         clearTimers();
         return errorResponse(504, "That took too long. Please try again.");
       }
-      skipNoReasoningFor = model;
       console.error(
         `OpenRouter request could not be completed for ${model}:`,
         error instanceof Error ? error.message : "unknown error",
@@ -261,7 +239,7 @@ export async function POST(request: Request) {
 
   if (!upstream?.body) {
     clearTimers();
-    console.error(`Career twin gave up after ${plan.length} attempt(s), last status ${lastStatus}`);
+    console.error(`Career twin gave up after ${models.length} attempt(s), last status ${lastStatus}`);
     return errorResponse(502, "I could not get an answer just now. Please try again shortly.");
   }
 
