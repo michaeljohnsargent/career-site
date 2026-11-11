@@ -228,6 +228,61 @@ describe("POST /api/chat streaming", () => {
     expect(body.messages.at(-1)).toEqual({ role: "user", content: "Hello" });
   });
 
+  it("retries without the reasoning parameter when the request is rejected as malformed", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: "unsupported parameter: reasoning" } }), {
+          status: 400,
+        }),
+      )
+      .mockResolvedValueOnce(
+        sseResponse(['data: {"choices":[{"delta":{"content":"recovered"}}]}\n', "data: [DONE]\n"]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = await readEvents(await POST(postRequest(askHello)));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const firstBody = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+    const secondBody = JSON.parse(String((fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body));
+
+    expect(firstBody.reasoning).toEqual({ effort: "none" });
+    expect(secondBody.reasoning).toBeUndefined();
+    // Everything else about the request must be unchanged.
+    expect(secondBody.stream).toBe(true);
+    expect(secondBody.messages).toEqual(firstBody.messages);
+
+    expect(events).toEqual([{ delta: "recovered" }, { done: true, truncated: false }]);
+  });
+
+  it("does not retry without reasoning when the failure was not a 400", async () => {
+    const fetchMock = vi.fn(async () => new Response("upstream on fire", { status: 500 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await POST(postRequest(askHello));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(502);
+  });
+
+  it("logs why a request was rejected instead of only its status", async () => {
+    const logged: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args) => {
+      logged.push(args.map(String).join(" "));
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ error: { message: "bad field xyz" } }), { status: 400 })),
+    );
+
+    await POST(postRequest(askHello));
+
+    expect(logged.some((line) => line.includes("bad field xyz"))).toBe(true);
+    errorSpy.mockRestore();
+  });
+
   it("reports upstream congestion as a retryable error", async () => {
     vi.stubGlobal(
       "fetch",

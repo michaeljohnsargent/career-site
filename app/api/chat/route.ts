@@ -11,21 +11,30 @@ export const runtime = "nodejs";
  * on a long-running Node process such as Azure App Service, where the real
  * limit is the front-end proxy's request timeout.
  *
- * Target is Vercel, whose Hobby plan allows up to 300 seconds per invocation,
- * counted across the whole response including streamed bytes. 60 is well
- * inside that and this route self-limits at TOTAL_TIMEOUT_MS below anyway, so
- * the platform should never be the thing that cuts a reply off.
- *
- * If this ever moves to Azure App Service, the value becomes inert (a
- * long-running Node process has no per-invocation limit) and the real ceiling
- * is the front-end proxy's request timeout, which Microsoft does not publish.
+ * TODO before deploying: confirm the actual limit for the chosen Azure target
+ * and align this value and FIRST_BYTE_TIMEOUT_MS below it. Microsoft's
+ * published docs do not state an execution limit for Static Web Apps managed
+ * functions, so this needs verifying against the running service rather than
+ * assumed. Streaming makes it far less likely to bite, because bytes start
+ * flowing within a second or two instead of only at the end.
  */
-export const maxDuration = 60;
+export const maxDuration = 90;
 
-/** Abort if the model has not produced its first byte in this long. */
+/**
+ * Abort if the model has not produced its first word of ANSWER in this long.
+ * OpenRouter sends keepalive comment lines while a model warms up, so this
+ * timer is deliberately cleared on the first content delta rather than on the
+ * first network chunk. Clearing it on any chunk let keepalives disarm the one
+ * guard meant to catch a model that never speaks.
+ */
 const FIRST_BYTE_TIMEOUT_MS = 20_000;
-/** Hard ceiling so a stalled stream cannot hold the function open. */
-const TOTAL_TIMEOUT_MS = 55_000;
+/**
+ * Hard ceiling so a stalled stream cannot hold the function open. Kept well
+ * under maxDuration so this route's own error handling always wins the race.
+ * At 55 against a 60 second platform limit it did not, and Vercel killed the
+ * invocation before the reader was ever told what went wrong.
+ */
+const TOTAL_TIMEOUT_MS = 45_000;
 
 const MAX_MESSAGES = 12;
 const MAX_MESSAGE_CHARS = 1500;
@@ -103,6 +112,7 @@ function requestCompletion(
   messages: ChatMessage[],
   apiKey: string,
   signal: AbortSignal,
+  includeReasoning: boolean,
 ): Promise<Response> {
   return fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -117,10 +127,14 @@ function requestCompletion(
       messages: [{ role: "system", content: systemPrompt }, ...messages],
       max_tokens: 1024,
       // Reasoning tokens are billed against max_tokens, and this task needs
-      // recall rather than deliberation, so they are turned off outright. The
-      // nested object is the shape OpenRouter documents; a flat
-      // `reasoning_effort` field is silently ignored.
-      reasoning: { effort: "none" },
+      // recall rather than deliberation, so they are turned off where the
+      // serving model supports saying so. The nested object is the shape
+      // OpenRouter documents; a flat `reasoning_effort` field is ignored.
+      //
+      // Omitted on a retry: the free router picks a different model per
+      // request and not all of them accept this parameter, which is one of
+      // the things that can turn an otherwise valid request into a 400.
+      ...(includeReasoning ? { reasoning: { effort: "none" } } : {}),
       // Low, because the job is factual recall from a fixed profile. Variety
       // between answers is a cost here, not a feature.
       temperature: 0.2,
@@ -174,16 +188,37 @@ export async function POST(request: Request) {
 
   // Connection and status failures are recoverable because nothing has reached
   // the browser yet, so a pinned model that is down falls back to the free
-  // router. A failure mid-stream is not recoverable and surfaces to the reader.
-  const attempts =
+  // router, and a request rejected as malformed is retried without the one
+  // optional parameter most likely to have caused it. A failure mid-stream is
+  // not recoverable and surfaces to the reader instead.
+  const models =
     PRIMARY_MODEL === FALLBACK_MODEL ? [PRIMARY_MODEL] : [PRIMARY_MODEL, FALLBACK_MODEL];
+
+  const plan: { model: string; reasoning: boolean }[] = [];
+  for (const model of models) {
+    plan.push({ model, reasoning: true });
+    plan.push({ model, reasoning: false });
+  }
 
   let upstream: Response | undefined;
   let servedBy = PRIMARY_MODEL;
+  let lastStatus = 0;
+  let skipNoReasoningFor = "";
 
-  for (const model of attempts) {
+  for (const { model, reasoning } of plan) {
+    // Only drop the reasoning parameter if the full request was rejected as
+    // malformed. Re-sending an identical-minus-one-field request after a 500
+    // or a network error just doubles the wait for no reason.
+    if (!reasoning && skipNoReasoningFor === model) continue;
+
     try {
-      const attempt = await requestCompletion(model, validated, apiKey, controller.signal);
+      const attempt = await requestCompletion(
+        model,
+        validated,
+        apiKey,
+        controller.signal,
+        reasoning,
+      );
 
       if (attempt.ok) {
         upstream = attempt;
@@ -191,17 +226,32 @@ export async function POST(request: Request) {
         break;
       }
 
+      lastStatus = attempt.status;
+
       if (attempt.status === 429) {
         clearTimers();
         return errorResponse(503, "The chat is busy right now. Please try again in a moment.");
       }
 
-      console.error(`OpenRouter request failed for ${model} with status ${attempt.status}`);
+      // Read the body rather than discarding it. Without this the logs say a
+      // request was rejected but never why, which is useless at 2am, and the
+      // unread body also leaves a socket dangling.
+      const detail = await attempt.text().catch(() => "");
+      console.error(
+        `OpenRouter rejected ${model} (reasoning=${reasoning}) with status ${attempt.status}: ${
+          detail.slice(0, 600) || "<empty body>"
+        }`,
+      );
+
+      // Anything other than a malformed-request complaint will not be fixed by
+      // sending the same thing with one field removed.
+      if (attempt.status !== 400) skipNoReasoningFor = model;
     } catch (error) {
       if (controller.signal.aborted) {
         clearTimers();
         return errorResponse(504, "That took too long. Please try again.");
       }
+      skipNoReasoningFor = model;
       console.error(
         `OpenRouter request could not be completed for ${model}:`,
         error instanceof Error ? error.message : "unknown error",
@@ -211,6 +261,7 @@ export async function POST(request: Request) {
 
   if (!upstream?.body) {
     clearTimers();
+    console.error(`Career twin gave up after ${plan.length} attempt(s), last status ${lastStatus}`);
     return errorResponse(502, "I could not get an answer just now. Please try again shortly.");
   }
 
@@ -238,10 +289,10 @@ export async function POST(request: Request) {
           return;
         }
 
-        clearFirstByteTimer();
-
         for (const event of parser.push(decoder.decode(value, { stream: true }))) {
           if (event.type === "delta") {
+            // Disarmed by the first real word, not by a keepalive comment.
+            clearFirstByteTimer();
             send(encodeClientEvent({ delta: event.text }));
             continue;
           }
