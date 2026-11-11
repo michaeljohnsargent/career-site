@@ -309,6 +309,37 @@ describe("POST /api/chat streaming", () => {
     vi.useRealTimers();
   });
 
+  it("starts pumping the upstream without waiting for anyone to read the response", async () => {
+    // The regression test for the bug that ate an afternoon. A pull-based
+    // stream only reads when the consumer asks, and in production the runtime
+    // frequently never asked, so the function sat until the platform killed
+    // it. Pumping from start() means the upstream is consumed regardless.
+    let reads = 0;
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        reads += 1;
+        if (reads === 1) {
+          controller.enqueue(
+            new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n'),
+          );
+        } else {
+          controller.enqueue(new TextEncoder().encode("data: [DONE]\n"));
+          controller.close();
+        }
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(upstream, { status: 200 })));
+
+    const response = await POST(postRequest(askHello));
+
+    // Deliberately do NOT read response.body here. Give the event loop a few
+    // turns and assert the pump ran anyway.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(reads).toBeGreaterThan(0);
+    expect(response.status).toBe(200);
+  });
+
   it("reports upstream congestion as a retryable error", async () => {
     vi.stubGlobal(
       "fetch",

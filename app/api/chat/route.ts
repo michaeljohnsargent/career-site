@@ -290,67 +290,108 @@ export async function POST(request: Request) {
   const parser = createStreamParser();
   const encoder = new TextEncoder();
 
+  /**
+   * Pumped from `start`, not `pull`, and that distinction is the whole bug.
+   *
+   * With a pull-based source the runtime decides when to ask for data, and in
+   * production it frequently never asked: headers came back from OpenRouter in
+   * under 300ms with a 200, and then nothing happened for ninety seconds until
+   * the platform killed the function. Because every read deadline lived inside
+   * `pull`, none of them ever ran either, which is why raising maxDuration only
+   * made the failures longer and why this looked for hours like a slow model
+   * rather than a stream nobody was reading.
+   *
+   * `start` begins pumping as soon as the stream is constructed, regardless of
+   * when or whether the consumer gets around to reading. The cost is losing
+   * backpressure, which is irrelevant for a few kilobytes of chat text.
+   */
   const stream = new ReadableStream<Uint8Array>({
-    async pull(out) {
+    async start(out) {
       const send = (line: string) => out.enqueue(encoder.encode(line));
+      let closed = false;
+      const finish = () => {
+        if (closed) return;
+        closed = true;
+        clearTimers();
+        out.close();
+      };
 
       try {
-        const { done, value } = await withDeadline(
-          reader.read(),
-          Math.min(IDLE_TIMEOUT_MS, msLeft()),
-          "the next part of the answer",
-        );
+        for (;;) {
+          const { done, value } = await withDeadline(
+            reader.read(),
+            Math.min(IDLE_TIMEOUT_MS, Math.max(1, msLeft())),
+            "the next part of the answer",
+          );
 
-        if (done) {
-          for (const event of parser.flush()) {
-            if (event.type === "delta") send(encodeClientEvent({ delta: event.text }));
-            else if (event.type === "error") send(encodeClientEvent({ error: event.message }));
-            else send(encodeClientEvent({ done: true, truncated: event.finishReason === "length" }));
-          }
-          console.log(`Career twin answered using ${parser.servedModel ?? servedBy}`);
-          clearTimers();
-          out.close();
-          return;
-        }
-
-        for (const event of parser.push(decoder.decode(value, { stream: true }))) {
-          if (event.type === "delta") {
-            send(encodeClientEvent({ delta: event.text }));
-            continue;
-          }
-
-          if (event.type === "error") {
-            send(encodeClientEvent({ error: event.message }));
-          } else {
-            send(encodeClientEvent({ done: true, truncated: event.finishReason === "length" }));
-            console.log(`Career twin answered using ${event.model ?? servedBy}`);
+          if (done) {
+            for (const event of parser.flush()) {
+              if (event.type === "delta") send(encodeClientEvent({ delta: event.text }));
+              else if (event.type === "error") send(encodeClientEvent({ error: event.message }));
+              else
+                send(encodeClientEvent({ done: true, truncated: event.finishReason === "length" }));
+            }
+            console.log(
+              `Career twin answered using ${parser.servedModel ?? servedBy} (${
+                Date.now() - startedAt
+              }ms in)`,
+            );
+            finish();
+            return;
           }
 
-          clearTimers();
-          out.close();
-          return;
+          let ended = false;
+
+          for (const event of parser.push(decoder.decode(value, { stream: true }))) {
+            if (event.type === "delta") {
+              send(encodeClientEvent({ delta: event.text }));
+              continue;
+            }
+
+            if (event.type === "error") {
+              send(encodeClientEvent({ error: event.message }));
+            } else {
+              send(encodeClientEvent({ done: true, truncated: event.finishReason === "length" }));
+              console.log(
+                `Career twin answered using ${event.model ?? servedBy} (${
+                  Date.now() - startedAt
+                }ms in)`,
+              );
+            }
+
+            ended = true;
+            break;
+          }
+
+          if (ended) {
+            finish();
+            return;
+          }
         }
       } catch (error) {
-        clearTimers();
         const timedOut = error instanceof StageTimeout || controller.signal.aborted;
         console.error(
-          "Career twin stream failed:",
+          `Career twin stream failed (${Date.now() - startedAt}ms in):`,
           error instanceof Error ? error.message : "unknown error",
         );
-        send(
-          encodeClientEvent({
-            error: timedOut
-              ? "That took too long. Please try again."
-              : "The answer stopped partway through. Please try again.",
-          }),
-        );
-        out.close();
+        if (!closed) {
+          send(
+            encodeClientEvent({
+              error: timedOut
+                ? "That took too long. Please try again."
+                : "The answer stopped partway through. Please try again.",
+            }),
+          );
+        }
+        finish();
+      } finally {
+        void reader.cancel().catch(() => {});
       }
     },
 
     cancel() {
       clearTimers();
-      void reader.cancel();
+      void reader.cancel().catch(() => {});
     },
   });
 
