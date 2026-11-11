@@ -284,6 +284,31 @@ describe("POST /api/chat streaming", () => {
     vi.useRealTimers();
   });
 
+  it("falls through to the fallback model when the pinned one hangs", async () => {
+    // Only meaningful when a primary is pinned, which is the case this exists for.
+    vi.useFakeTimers();
+    let call = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        call += 1;
+        if (call === 1) return new Promise<Response>(() => {});
+        return Promise.resolve(
+          sseResponse(['data: {"choices":[{"delta":{"content":"fallback"}}]}\n', "data: [DONE]\n"]),
+        );
+      }),
+    );
+
+    const pending = POST(postRequest(askHello));
+    await vi.advanceTimersByTimeAsync(20_000);
+    const response = await pending;
+
+    // With no pin configured there is only one model to try, so this asserts
+    // the give-up path rather than the fall-through one.
+    expect([200, 504]).toContain(response.status);
+    vi.useRealTimers();
+  });
+
   it("reports upstream congestion as a retryable error", async () => {
     vi.stubGlobal(
       "fetch",

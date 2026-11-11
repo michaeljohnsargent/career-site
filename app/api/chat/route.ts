@@ -34,7 +34,7 @@ export const maxDuration = 90;
  * the mechanism.
  */
 /** Give up if the upstream has not responded at all by now. */
-const CONNECT_TIMEOUT_MS = 20_000;
+const CONNECT_TIMEOUT_MS = 15_000;
 /** Give up if an open stream goes this long without producing anything. */
 const IDLE_TIMEOUT_MS = 20_000;
 /** Hard ceiling on the whole exchange, well under maxDuration. */
@@ -190,6 +190,14 @@ export async function POST(request: Request) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) return errorResponse(503, "The chat is not configured yet. Please try again later.");
 
+  // Logged before anything can block, so silence in the logs means the handler
+  // never ran rather than that a call hung inside it. Those two look identical
+  // otherwise, and telling them apart took an afternoon.
+  const startedAt = Date.now();
+  console.log(
+    `Career twin request: ${validated.length} message(s), primary=${PRIMARY_MODEL}, prompt=${systemPrompt.length} chars`,
+  );
+
   const controller = new AbortController();
   const expiresAt = Date.now() + TOTAL_TIMEOUT_MS;
   const msLeft = () => expiresAt - Date.now();
@@ -212,10 +220,14 @@ export async function POST(request: Request) {
 
   for (const model of models) {
     try {
+      console.log(`Career twin calling ${model} (${Date.now() - startedAt}ms in)`);
       const attempt = await withDeadline(
         requestCompletion(model, validated, apiKey, controller.signal),
         Math.min(CONNECT_TIMEOUT_MS, msLeft()),
         `${model} to respond`,
+      );
+      console.log(
+        `Career twin got headers from ${model}: ${attempt.status} (${Date.now() - startedAt}ms in)`,
       );
 
       if (attempt.ok) {
@@ -242,9 +254,22 @@ export async function POST(request: Request) {
         }`,
       );
     } catch (error) {
-      if (error instanceof StageTimeout || controller.signal.aborted || msLeft() <= 0) {
+      const timedOut = error instanceof StageTimeout || controller.signal.aborted;
+
+      if (timedOut) {
+        console.error(
+          `Career twin gave up waiting for ${model} to respond (${Date.now() - startedAt}ms in)`,
+        );
+        // Fall through to the next model if there is one and time remains.
+        // Only give up when there is nothing left to try.
+        const isLast = model === models[models.length - 1];
+        if (!isLast && msLeft() > 2_000) continue;
         clearTimers();
-        console.error(`Career twin gave up waiting for ${model} to respond`);
+        return errorResponse(504, "That took too long. Please try again.");
+      }
+
+      if (msLeft() <= 0) {
+        clearTimers();
         return errorResponse(504, "That took too long. Please try again.");
       }
       console.error(
