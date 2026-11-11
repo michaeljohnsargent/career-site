@@ -245,6 +245,45 @@ describe("POST /api/chat streaming", () => {
     errorSpy.mockRestore();
   });
 
+  it("gives up on an upstream that never responds instead of hanging", async () => {
+    vi.useFakeTimers();
+    // A fetch that never settles, which is exactly what production looked like.
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+
+    const pending = POST(postRequest(askHello));
+    await vi.advanceTimersByTimeAsync(25_000);
+    const response = await pending;
+
+    expect(response.status).toBe(504);
+    await expect(response.json()).resolves.toEqual({
+      error: "That took too long. Please try again.",
+    });
+    vi.useRealTimers();
+  });
+
+  it("gives up on a stream that opens and then goes silent", async () => {
+    vi.useFakeTimers();
+    // Headers arrive, one word arrives, then nothing ever again.
+    const stalling = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode('data: {"choices":[{"delta":{"content":"I"}}]}\n'),
+        );
+        // Never closed, never enqueued again.
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(stalling, { status: 200 })));
+
+    const pending = POST(postRequest(askHello));
+    const response = await pending;
+    const reading = response.text();
+    await vi.advanceTimersByTimeAsync(25_000);
+    const body = await reading;
+
+    expect(body).toContain("That took too long");
+    vi.useRealTimers();
+  });
+
   it("reports upstream congestion as a retryable error", async () => {
     vi.stubGlobal(
       "fetch",

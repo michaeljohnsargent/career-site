@@ -11,8 +11,8 @@ export const runtime = "nodejs";
  * on a long-running Node process such as Azure App Service, where the real
  * limit is the front-end proxy's request timeout.
  *
- * TODO before deploying: confirm the actual limit for the chosen Azure target
- * and align this value and FIRST_BYTE_TIMEOUT_MS below it. Microsoft's
+ * TODO if this ever moves to Azure: confirm the real limit for that target
+ * and align the deadlines below it. Microsoft's
  * published docs do not state an execution limit for Static Web Apps managed
  * functions, so this needs verifying against the running service rather than
  * assumed. Streaming makes it far less likely to bite, because bytes start
@@ -21,20 +21,42 @@ export const runtime = "nodejs";
 export const maxDuration = 90;
 
 /**
- * Abort if the model has not produced its first word of ANSWER in this long.
- * OpenRouter sends keepalive comment lines while a model warms up, so this
- * timer is deliberately cleared on the first content delta rather than on the
- * first network chunk. Clearing it on any chunk let keepalives disarm the one
- * guard meant to catch a model that never speaks.
+ * Every wait in this route is bounded by racing it against a timer, not by an
+ * AbortController alone.
+ *
+ * That is deliberate and was learned the hard way. In production the abort
+ * signal did not reliably tear down a stalled upstream call, so the only thing
+ * stopping a hung request was Vercel's own limit. Raising maxDuration from 60
+ * to 90 simply made the failures take thirty seconds longer, which is how it
+ * became clear the internal timers were never the thing firing. A Promise.race
+ * depends on nothing but setTimeout resolving, so it cannot fail that way. The
+ * AbortController is still handed to fetch, but now as cleanup rather than as
+ * the mechanism.
  */
-const FIRST_BYTE_TIMEOUT_MS = 20_000;
-/**
- * Hard ceiling so a stalled stream cannot hold the function open. Kept well
- * under maxDuration so this route's own error handling always wins the race.
- * At 55 against a 60 second platform limit it did not, and Vercel killed the
- * invocation before the reader was ever told what went wrong.
- */
-const TOTAL_TIMEOUT_MS = 45_000;
+/** Give up if the upstream has not responded at all by now. */
+const CONNECT_TIMEOUT_MS = 20_000;
+/** Give up if an open stream goes this long without producing anything. */
+const IDLE_TIMEOUT_MS = 20_000;
+/** Hard ceiling on the whole exchange, well under maxDuration. */
+const TOTAL_TIMEOUT_MS = 55_000;
+
+class StageTimeout extends Error {
+  constructor(stage: string) {
+    super(`timed out waiting for ${stage}`);
+    this.name = "StageTimeout";
+  }
+}
+
+/** Resolves with the promise, or rejects once `ms` has passed, whichever first. */
+function withDeadline<T>(promise: Promise<T>, ms: number, stage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new StageTimeout(stage)), Math.max(1, ms));
+    }),
+  ]);
+}
 
 const MAX_MESSAGES = 12;
 const MAX_MESSAGE_CHARS = 1500;
@@ -169,22 +191,12 @@ export async function POST(request: Request) {
   if (!apiKey) return errorResponse(503, "The chat is not configured yet. Please try again later.");
 
   const controller = new AbortController();
-  let firstByteTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(
-    () => controller.abort(),
-    FIRST_BYTE_TIMEOUT_MS,
-  );
-  const totalTimer = setTimeout(() => controller.abort(), TOTAL_TIMEOUT_MS);
+  const expiresAt = Date.now() + TOTAL_TIMEOUT_MS;
+  const msLeft = () => expiresAt - Date.now();
 
-  const clearFirstByteTimer = () => {
-    if (firstByteTimer) {
-      clearTimeout(firstByteTimer);
-      firstByteTimer = undefined;
-    }
-  };
-  const clearTimers = () => {
-    clearFirstByteTimer();
-    clearTimeout(totalTimer);
-  };
+  // Kept so an abandoned upstream connection is asked to close. Nothing in
+  // this route depends on that request being honoured.
+  const clearTimers = () => controller.abort();
 
   // Connection and status failures are recoverable because nothing has reached
   // the browser yet, so a pinned model that is down falls back to the free
@@ -200,7 +212,11 @@ export async function POST(request: Request) {
 
   for (const model of models) {
     try {
-      const attempt = await requestCompletion(model, validated, apiKey, controller.signal);
+      const attempt = await withDeadline(
+        requestCompletion(model, validated, apiKey, controller.signal),
+        Math.min(CONNECT_TIMEOUT_MS, msLeft()),
+        `${model} to respond`,
+      );
 
       if (attempt.ok) {
         upstream = attempt;
@@ -226,8 +242,9 @@ export async function POST(request: Request) {
         }`,
       );
     } catch (error) {
-      if (controller.signal.aborted) {
+      if (error instanceof StageTimeout || controller.signal.aborted || msLeft() <= 0) {
         clearTimers();
+        console.error(`Career twin gave up waiting for ${model} to respond`);
         return errorResponse(504, "That took too long. Please try again.");
       }
       console.error(
@@ -253,7 +270,11 @@ export async function POST(request: Request) {
       const send = (line: string) => out.enqueue(encoder.encode(line));
 
       try {
-        const { done, value } = await reader.read();
+        const { done, value } = await withDeadline(
+          reader.read(),
+          Math.min(IDLE_TIMEOUT_MS, msLeft()),
+          "the next part of the answer",
+        );
 
         if (done) {
           for (const event of parser.flush()) {
@@ -269,8 +290,6 @@ export async function POST(request: Request) {
 
         for (const event of parser.push(decoder.decode(value, { stream: true }))) {
           if (event.type === "delta") {
-            // Disarmed by the first real word, not by a keepalive comment.
-            clearFirstByteTimer();
             send(encodeClientEvent({ delta: event.text }));
             continue;
           }
@@ -288,14 +307,14 @@ export async function POST(request: Request) {
         }
       } catch (error) {
         clearTimers();
-        const aborted = controller.signal.aborted;
+        const timedOut = error instanceof StageTimeout || controller.signal.aborted;
         console.error(
           "Career twin stream failed:",
           error instanceof Error ? error.message : "unknown error",
         );
         send(
           encodeClientEvent({
-            error: aborted
+            error: timedOut
               ? "That took too long. Please try again."
               : "The answer stopped partway through. Please try again.",
           }),
