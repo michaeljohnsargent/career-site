@@ -2,6 +2,8 @@
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 
+import { stripMarkdown } from "./strip-markdown";
+
 type Message = { role: "user" | "assistant"; content: string; truncated?: boolean };
 
 /** Must match MAX_MESSAGES in app/api/chat/route.ts. */
@@ -259,7 +261,7 @@ export default function TwinChat() {
                       <span className="sr-only">Writing a response</span>
                     </span>
                   ) : (
-                    <p>{message.content}</p>
+                    <p>{stripMarkdown(message.content)}</p>
                   )}
                   {message.truncated && (
                     <span className="message-truncated">
