@@ -6,6 +6,87 @@
 
 ---
 
+## Status as of November 10, 2026 (evening)
+
+Everything below was written as a review before any of it was acted on. Most of
+it has since been implemented in the same session. This section records what
+changed so the findings stay readable as findings rather than as a stale to-do
+list.
+
+**Done and verified.** P0-1 (the served resume is now the current two-page
+version, confirmed by extracting its text on the machine it was written to),
+P0-2 (committed), P0-3 (per-IP and global daily rate limiting), P1-1 (career
+facts extracted to `app/content/career.ts`, consumed by both the timeline and
+the system prompt), P1-2, P1-3 (streaming, see the caveat below), P1-6 (the
+twin now speaks in the first person, unconditionally), P2-1 through P2-10, and
+every P3 item.
+
+Verification performed: `tsc --noEmit` clean, `eslint .` clean, 38 unit tests
+passing across the SSE parser, the rate limiter, and the API route, a
+production build, and a smoke test against the built server confirming the page
+renders the two First Franklin phases, the JSON-LD block is present, all five
+security headers are emitted, the API returns correct errors, and the 404 page
+renders.
+
+**Done with a caveat.**
+
+*P1-3, streaming.* Implemented and unit tested against a stubbed upstream,
+including the mid-stream-error and truncation paths. It has never run against
+the real OpenRouter API, because neither this machine's shell nor the sandbox
+can reach openrouter.ai. First live use is the real test.
+
+*P1-4, model pinning.* The mechanism is in place: set `OPENROUTER_MODEL` to pin
+a slug, with `openrouter/free` as an automatic fallback if the pinned model
+fails to respond, and the model that actually served each answer is now logged.
+No slug is pinned, deliberately. The free-model listing could not be enumerated
+in full, and the one plausible small instruct model found carries a notice that
+prompts and outputs may be retained for training, which is a poor fit for a
+page where recruiters type questions. Pinning a guessed slug would have been
+worse than leaving the router in place. Watch the logs for a week, then set the
+env var. No code change needed to do it.
+
+*P1-5, maxDuration.* Set to 60 with a comment. Microsoft's published docs do
+not state an execution limit for Static Web Apps managed functions, and the
+230-second App Service figure could not be confirmed from Learn either, so the
+number is a conservative placeholder rather than a verified fit. Streaming
+makes it far less likely to matter.
+
+*P2-8, discoverability.* `app/icon.png` and `app/opengraph-image.png` are
+generated in the site palette and picked up by Next's file conventions. A
+`Person` JSON-LD block and a canonical link are in place. `metadataBase` reads
+`NEXT_PUBLIC_SITE_URL` and falls back to localhost, so it still needs the real
+domain.
+
+**Found while implementing, not in the original review.**
+
+1. `eslint-config-next` 16 ships native flat config. The usual `FlatCompat`
+   bridge fails against it with a circular-structure error, on both eslint 9
+   and 10. The config here imports the flat exports directly. Separately,
+   eslint-config-next's plugins do not yet support eslint 10, so eslint is
+   pinned to 9.x, which npm labels maintenance-only. That is Next's ecosystem
+   lag, not something to fix here.
+
+2. The chat suggestion chips were phrased from the wrong point of view: "What
+   makes my experience different?" reads as the visitor asking about their own
+   experience. The first-person decision made it worse. Now rephrased to the
+   visitor's voice.
+
+3. Hosting, worth knowing before committing to Azure Static Web Apps: Microsoft
+   documents hybrid Next.js on SWA as preview, says its server functions run on
+   a dedicated App Service instance, and requires the Standard plan with at
+   least an S1 App Service plan for a linked backend. For a one-page portfolio
+   that is real cost and real complexity. Not a recommendation to change
+   targets, just a fact that should not surprise you at deploy time.
+
+**Still open.** Run `npm install` before `npm run lint` or `npm test` will work
+on this machine, since both tools are new devDependencies. Verify streaming
+live. Pin a model once the logs show a good one. Set `NEXT_PUBLIC_SITE_URL` to
+the real domain. Confirm the Azure timeout and align `maxDuration`. A full
+Content-Security-Policy remains deliberately deferred, for the reason given in
+P2-4.
+
+---
+
 ## Scope and method
 
 Every source file in the project was read in full: `app/page.tsx`, `app/layout.tsx`, `app/globals.css`, `app/components/TwinChat.tsx`, `app/api/chat/route.ts`, `next.config.ts`, `tsconfig.json`, `package.json`, `.gitignore`, and the contents of `public/`. `node_modules/` and `.next/` were excluded.
